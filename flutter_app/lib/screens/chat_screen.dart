@@ -277,6 +277,7 @@ User message:
 $text
 ''';
       final history = _messages
+          .where((message) => message.id != userMessage.id)
           .where((message) => !message.id.startsWith('e'))
           .map((message) => {
                 'role': message.isUser ? 'user' : 'model',
@@ -362,8 +363,12 @@ $text
                 decoration: const BoxDecoration(
                     color: Color(0xFF22C55E), shape: BoxShape.circle)),
             const SizedBox(width: 6),
-            const Text('Online · ADHD topics only',
-                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w400)),
+            const Flexible(
+                child: Text('Online · ADHD topics only',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style:
+                        TextStyle(fontSize: 11, fontWeight: FontWeight.w400))),
           ]),
         ]),
         actions: [
