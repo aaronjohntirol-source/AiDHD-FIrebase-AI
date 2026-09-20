@@ -1,11 +1,11 @@
 import 'dart:convert';
-import 'package:firebase_ai/firebase_ai.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../models/history_entry.dart';
 import '../providers/app_provider.dart';
+import '../services/ai_key_service.dart';
 import '../services/chat_service.dart';
+import '../services/gemini_service.dart';
 import '../theme/app_theme.dart';
 
 class _Message {
@@ -32,8 +32,9 @@ class _ChatScreenState extends State<ChatScreen> {
   final _scrollCtrl = ScrollController();
   final List<_Message> _messages = [];
   final _chatService = ChatService();
-  late final GenerativeModel _model;
-  late ChatSession _chat;
+  final _keyService = AiKeyService();
+  final _geminiService = GeminiService();
+  String? _apiKey;
   bool _isTyping = false;
   bool _isLoading = true;
 
@@ -64,12 +65,6 @@ line immediately.
   @override
   void initState() {
     super.initState();
-    final ai = FirebaseAI.googleAI();
-    _model = ai.generativeModel(
-      model: 'gemini-2.5-flash',
-      systemInstruction: Content.system(_systemPrompt),
-    );
-    _chat = _model.startChat();
     _loadChat();
   }
 
@@ -84,6 +79,7 @@ line immediately.
     try {
       final records = await _chatService.getMessages(userId);
       if (!mounted) return;
+      _apiKey = await _ensureApiKey();
       if (records.isNotEmpty) {
         _messages.addAll(records.map((record) => _Message(
               id: record.id,
@@ -91,15 +87,10 @@ line immediately.
               text: record.text,
               time: record.time,
             )));
-        final history = records
-            .map((record) => Content(
-                  record.isUser ? 'user' : 'model',
-                  [TextPart(record.text)],
-                ))
-            .toList();
-        _chat = _model.startChat(history: history);
       } else {
-        final greeting = _buildGreeting(app);
+        final greeting = _apiKey == null
+            ? _buildGreeting(app)
+            : await _generateOpeningMessage(app);
         final message = _Message(
           id: 'intro_${DateTime.now().millisecondsSinceEpoch}',
           isUser: false,
@@ -125,6 +116,87 @@ line immediately.
       ));
     } finally {
       if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<String?> _ensureApiKey({bool replace = false}) async {
+    final userId = context.read<AppProvider>().currentUser?.id;
+    if (userId == null) return null;
+    if (!replace) {
+      final saved = await _keyService.getKey(userId);
+      if (saved != null) return saved;
+    }
+    if (!mounted) return null;
+    final controller = TextEditingController();
+    final key = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(replace ? 'Replace Gemini API key' : 'Connect Gemini'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Paste your Gemini API key to use the ADHD support chat. It is stored only on this device for your account and is never added to chat history.',
+              style: TextStyle(height: 1.4),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              obscureText: true,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: 'Gemini API key',
+                hintText: 'AIza...',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              'Create a key in Google AI Studio. Replace it here if it reaches its usage limit; your conversation will remain available.',
+              style: TextStyle(fontSize: 12, color: AppColors.textMid),
+            ),
+          ],
+        ),
+        actions: [
+          if (replace)
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+          FilledButton(
+            onPressed: () {
+              final value = controller.text.trim();
+              if (value.isNotEmpty) Navigator.pop(dialogContext, value);
+            },
+            child: const Text('Save key'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (key == null || key.trim().isEmpty) return null;
+    await _keyService.saveKey(userId, key);
+    return key.trim();
+  }
+
+  Future<String> _generateOpeningMessage(AppProvider app) async {
+    try {
+      return await _geminiService.sendMessage(
+        apiKey: _apiKey!,
+        systemPrompt: _systemPrompt,
+        history: const [],
+        message:
+            '''Start this support conversation with the user. Use this context:
+${jsonEncode(app.buildAiContext())}
+
+Mention one relevant observation from their initial assessment, latest mood, or daily assessment if available. Offer one small coping step and ask how they are doing right now.''',
+      );
+    } on GeminiException catch (error) {
+      if (error.keyProblem) _apiKey = await _ensureApiKey(replace: true);
+      return _buildGreeting(app);
     }
   }
 
@@ -180,6 +252,8 @@ line immediately.
     final app = context.read<AppProvider>();
     final userId = app.currentUser?.id;
     if (userId == null) return;
+    _apiKey ??= await _ensureApiKey();
+    if (_apiKey == null) return;
     _ctrl.clear();
     final userMessage = _Message(
       id: 'u${DateTime.now().millisecondsSinceEpoch}',
@@ -202,8 +276,19 @@ ${jsonEncode(app.buildAiContext())}
 User message:
 $text
 ''';
-      final response = await _chat.sendMessage(Content.text(prompt));
-      final reply = response.text ?? 'I could not generate a response.';
+      final history = _messages
+          .where((message) => !message.id.startsWith('e'))
+          .map((message) => {
+                'role': message.isUser ? 'user' : 'model',
+                'text': message.text,
+              })
+          .toList();
+      final reply = await _geminiService.sendMessage(
+        apiKey: _apiKey!,
+        systemPrompt: _systemPrompt,
+        history: history,
+        message: prompt,
+      );
       final assistantMessage = _Message(
         id: 'a${DateTime.now().millisecondsSinceEpoch}',
         isUser: false,
@@ -215,28 +300,28 @@ $text
         _messages.add(assistantMessage);
       });
       await _persistMessage(userId, assistantMessage);
-    } on FirebaseAIException catch (error) {
-      debugPrint('Firebase AI error: ${error.message}');
+    } on GeminiException catch (error) {
       if (!mounted) return;
+      if (error.keyProblem) {
+        _apiKey = await _ensureApiKey(replace: true);
+      }
       setState(() {
         _messages.add(_Message(
           id: 'e${DateTime.now().millisecondsSinceEpoch}',
           isUser: false,
-          text: _userFacingAiError(error.message),
+          text: error.keyProblem
+              ? 'Your Gemini key needs attention. Add a working key to continue; your chat history is still here.'
+              : error.message,
           time: _now(),
         ));
       });
     } catch (error) {
-      debugPrint('Unexpected chat error: $error');
       if (!mounted) return;
-        final message = !kIsWeb && defaultTargetPlatform == TargetPlatform.windows
-          ? 'Firebase AI chat is not supported in the Windows desktop build. Run the app on Chrome, Android, iOS, or macOS.'
-          : 'The assistant is temporarily unavailable. Please try again.';
       setState(() {
         _messages.add(_Message(
           id: 'e${DateTime.now().millisecondsSinceEpoch}',
           isUser: false,
-          text: message,
+          text: 'The assistant is temporarily unavailable. Please try again.',
           time: _now(),
         ));
       });
@@ -246,21 +331,6 @@ $text
         _scrollToBottom();
       }
     }
-  }
-
-  String _userFacingAiError(String message) {
-    final lower = message.toLowerCase();
-    if (lower.contains('app check') || lower.contains('app attestation')) {
-      return 'Firebase App Check is not registered for this app. Register the browser debug token in Firebase Console, then reload.';
-    }
-    if (lower.contains('enable firebase ai logic') ||
-        lower.contains('service api')) {
-      return 'Firebase AI Logic is not enabled for this project yet. Open AI Services > AI Logic and finish setup.';
-    }
-    if (lower.contains('quota') || lower.contains('limit')) {
-      return 'The AI usage limit has been reached. Check Firebase AI Logic quotas and billing settings.';
-    }
-    return 'The AI service returned an error. Check the Firebase AI Logic setup and try again.';
   }
 
   void _scrollToBottom() {
@@ -296,6 +366,16 @@ $text
                 style: TextStyle(fontSize: 11, fontWeight: FontWeight.w400)),
           ]),
         ]),
+        actions: [
+          IconButton(
+            tooltip: 'Replace Gemini API key',
+            icon: const Icon(Icons.key_outlined),
+            onPressed: () async {
+              final key = await _ensureApiKey(replace: true);
+              if (key != null && mounted) setState(() => _apiKey = key);
+            },
+          ),
+        ],
         centerTitle: false,
       ),
       body: Column(children: [
