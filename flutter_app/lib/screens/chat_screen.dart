@@ -44,6 +44,11 @@ You are the AIDHD support assistant.
 Only discuss ADHD-related focus, routines, organization, study strategies,
 emotional regulation, and general educational support.
 
+You are AIDHD, a proactive daily support companion, not a generic question-
+answering chatbot. Begin by checking in on how the user feels today. Use the
+most recent mood, daily assessment, and initial assessment only as supportive
+context. Never treat those results as a diagnosis.
+
 Do not diagnose ADHD. Do not prescribe medication or give treatment
 instructions. Do not pretend to be a doctor. For medical or treatment
 questions, recommend speaking with a qualified healthcare professional.
@@ -52,6 +57,12 @@ The user is 13 or older. Use supportive, practical, concise language. Do not
 make assumptions about the user's diagnosis. If the user mentions immediate
 danger or self-harm, encourage contacting local emergency services or a crisis
 line immediately.
+
+Keep each response warm and concise. Reflect one relevant detail, ask one
+gentle question, and offer no more than one small action the user can try now.
+Avoid repeating the same greeting or advice. If the user seems overwhelmed,
+reduce the task to a two-minute step and celebrate starting rather than
+completion.
 ''';
 
   String _now() {
@@ -188,11 +199,14 @@ line immediately.
         apiKey: _apiKey!,
         systemPrompt: _systemPrompt,
         history: const [],
-        message:
-            '''Start this support conversation with the user. Use this context:
+        message: '''You are opening today's AIDHD check-in. Use this context:
 ${jsonEncode(app.buildAiContext())}
 
-Mention one relevant observation from their initial assessment, latest mood, or daily assessment if available. Offer one small coping step and ask how they are doing right now.''',
+    Start with a natural, human-sounding check-in. Mention only one relevant
+    observation from the latest mood or daily assessment, if available. Briefly
+    connect it to their initial assessment only when useful. Then ask how they feel
+    right now and offer one small ADHD-friendly coping step. Do not list all of the
+    stored data, use clinical labels, or say that you are an AI.''',
       );
     } on GeminiException catch (error) {
       if (error.keyProblem) _apiKey = await _ensureApiKey(replace: true);
@@ -220,9 +234,9 @@ Mention one relevant observation from their initial assessment, latest mood, or 
           'your initial screening was ${app.currentUser!.initialAssessmentCategory!.toLowerCase()}');
     }
     final contextLine = parts.isEmpty
-        ? 'How are you feeling today, and what would be most useful to work on?'
-        : '${parts.join(', and ')}. Would you like to talk through how today is going or choose one small next step?';
-    return 'Hi${name.isNotEmpty ? " $name" : ""}! I\'m here with you. $contextLine';
+        ? 'Before we plan anything, how are you feeling today? We can take one small step together.'
+        : '${parts.join(', and ')}. How are you feeling right now? We can choose one small next step together.';
+    return 'Hi${name.isNotEmpty ? " $name" : ""}. I\'m your AIDHD check-in companion. $contextLine';
   }
 
   @override
