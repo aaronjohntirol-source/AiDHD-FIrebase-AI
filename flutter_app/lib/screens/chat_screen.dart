@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../models/history_entry.dart';
 import '../providers/app_provider.dart';
+import '../services/ai_key_service.dart';
 import '../services/chat_service.dart';
 import '../services/gemini_service.dart';
 import '../theme/app_theme.dart';
@@ -31,9 +32,27 @@ class _ChatScreenState extends State<ChatScreen> {
   final _scrollCtrl = ScrollController();
   final List<_Message> _messages = [];
   final _chatService = ChatService();
+  final _keyService = AiKeyService();
   final _geminiService = GeminiService();
+  String? _apiKey;
   bool _isTyping = false;
   bool _isLoading = true;
+
+  static const _systemPrompt = '''
+You are the AIDHD support assistant.
+
+Only discuss ADHD-related focus, routines, organization, study strategies,
+emotional regulation, and general educational support.
+
+Do not diagnose ADHD. Do not prescribe medication or give treatment
+instructions. Do not pretend to be a doctor. For medical or treatment
+questions, recommend speaking with a qualified healthcare professional.
+
+The user is 13 or older. Use supportive, practical, concise language. Do not
+make assumptions about the user's diagnosis. If the user mentions immediate
+danger or self-harm, encourage contacting local emergency services or a crisis
+line immediately.
+''';
 
   String _now() {
     final t = DateTime.now();
@@ -60,6 +79,7 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final records = await _chatService.getMessages(userId);
       if (!mounted) return;
+      _apiKey = await _ensureApiKey();
       if (records.isNotEmpty) {
         _messages.addAll(records.map((record) => _Message(
               id: record.id,
@@ -68,7 +88,9 @@ class _ChatScreenState extends State<ChatScreen> {
               time: record.time,
             )));
       } else {
-        final greeting = await _generateOpeningMessage(app);
+        final greeting = _apiKey == null
+            ? _buildGreeting(app)
+            : await _generateOpeningMessage(app);
         final message = _Message(
           id: 'intro_${DateTime.now().millisecondsSinceEpoch}',
           isUser: false,
@@ -97,10 +119,74 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Future<String?> _ensureApiKey({bool replace = false}) async {
+    final userId = context.read<AppProvider>().currentUser?.id;
+    if (userId == null) return null;
+    if (!replace) {
+      final saved = await _keyService.getKey(userId);
+      if (saved != null) return saved;
+    }
+    if (!mounted) return null;
+    final controller = TextEditingController();
+    final key = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(replace ? 'Replace Gemini API key' : 'Connect Gemini'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Paste your Gemini API key to use the ADHD support chat. It is stored only on this device for your account and is never added to chat history.',
+              style: TextStyle(height: 1.4),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              obscureText: true,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: 'Gemini API key',
+                hintText: 'AIza...',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              'Create a key in Google AI Studio. Replace it here if it reaches its usage limit; your conversation will remain available.',
+              style: TextStyle(fontSize: 12, color: AppColors.textMid),
+            ),
+          ],
+        ),
+        actions: [
+          if (replace)
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+          FilledButton(
+            onPressed: () {
+              final value = controller.text.trim();
+              if (value.isNotEmpty) Navigator.pop(dialogContext, value);
+            },
+            child: const Text('Save key'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (key == null || key.trim().isEmpty) return null;
+    await _keyService.saveKey(userId, key);
+    return key.trim();
+  }
+
   Future<String> _generateOpeningMessage(AppProvider app) async {
     try {
       return await _geminiService.sendMessage(
-        userContext: app.buildAiContext(),
+        apiKey: _apiKey!,
+        systemPrompt: _systemPrompt,
         history: const [],
         message:
             '''Start this support conversation with the user. Use this context:
@@ -108,7 +194,8 @@ ${jsonEncode(app.buildAiContext())}
 
 Mention one relevant observation from their initial assessment, latest mood, or daily assessment if available. Offer one small coping step and ask how they are doing right now.''',
       );
-    } on GeminiException catch (_) {
+    } on GeminiException catch (error) {
+      if (error.keyProblem) _apiKey = await _ensureApiKey(replace: true);
       return _buildGreeting(app);
     }
   }
@@ -165,6 +252,8 @@ Mention one relevant observation from their initial assessment, latest mood, or 
     final app = context.read<AppProvider>();
     final userId = app.currentUser?.id;
     if (userId == null) return;
+    _apiKey ??= await _ensureApiKey();
+    if (_apiKey == null) return;
     _ctrl.clear();
     final userMessage = _Message(
       id: 'u${DateTime.now().millisecondsSinceEpoch}',
@@ -196,7 +285,8 @@ $text
               })
           .toList();
       final reply = await _geminiService.sendMessage(
-        userContext: app.buildAiContext(),
+        apiKey: _apiKey!,
+        systemPrompt: _systemPrompt,
         history: history,
         message: prompt,
       );
@@ -213,11 +303,16 @@ $text
       await _persistMessage(userId, assistantMessage);
     } on GeminiException catch (error) {
       if (!mounted) return;
+      if (error.keyProblem) {
+        _apiKey = await _ensureApiKey(replace: true);
+      }
       setState(() {
         _messages.add(_Message(
           id: 'e${DateTime.now().millisecondsSinceEpoch}',
           isUser: false,
-          text: error.message,
+          text: error.keyProblem
+              ? 'Your Gemini key needs attention. Add a working key to continue; your chat history is still here.'
+              : error.message,
           time: _now(),
         ));
       });
@@ -276,6 +371,16 @@ $text
                         TextStyle(fontSize: 11, fontWeight: FontWeight.w400))),
           ]),
         ]),
+        actions: [
+          IconButton(
+            tooltip: 'Replace Gemini API key',
+            icon: const Icon(Icons.key_outlined),
+            onPressed: () async {
+              final key = await _ensureApiKey(replace: true);
+              if (key != null && mounted) setState(() => _apiKey = key);
+            },
+          ),
+        ],
         centerTitle: false,
       ),
       body: Column(children: [
