@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
+import 'ai_provider_service.dart';
 
 class GeminiException implements Exception {
   final String message;
@@ -13,16 +14,25 @@ class GeminiException implements Exception {
 }
 
 class GeminiService {
-  static const _model = 'gemini-3.1-flash-lite-preview';
-  static const _endpoint =
-      'https://generativelanguage.googleapis.com/v1beta/models/$_model:generateContent';
-
   Future<String> sendMessage({
-    required String apiKey,
+    required AiProviderConfig config,
     required String systemPrompt,
     required List<Map<String, String>> history,
     required String message,
   }) async {
+    if (config.provider == AiProvider.gemini) {
+      return _sendGemini(config, systemPrompt, history, message);
+    }
+    return _sendOpenAiCompatible(config, systemPrompt, history, message);
+  }
+
+  Future<String> _sendGemini(
+    AiProviderConfig config,
+    String systemPrompt,
+    List<Map<String, String>> history,
+    String message,
+  ) async {
+    final endpoint = '${config.endpoint}/${config.model}:generateContent';
     final contents = [
       ...history.map((item) => {
             'role': item['role']!,
@@ -39,7 +49,7 @@ class GeminiService {
     ];
 
     final response = await http.post(
-      Uri.parse('$_endpoint?key=${Uri.encodeQueryComponent(apiKey)}'),
+      Uri.parse('$endpoint?key=${Uri.encodeQueryComponent(config.apiKey)}'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({
         'systemInstruction': {
@@ -80,6 +90,51 @@ class GeminiService {
       throw const GeminiException('Gemini returned an empty response.');
     }
     return (parts.first['text'] as String).trim();
+  }
+
+  Future<String> _sendOpenAiCompatible(
+    AiProviderConfig config,
+    String systemPrompt,
+    List<Map<String, String>> history,
+    String message,
+  ) async {
+    final messages = [
+      {'role': 'system', 'content': systemPrompt},
+      ...history.map((item) => {
+            'role': item['role'] == 'model' ? 'assistant' : 'user',
+            'content': item['text']!,
+          }),
+      {'role': 'user', 'content': message},
+    ];
+    final response = await http.post(
+      Uri.parse(config.endpoint),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ${config.apiKey}',
+      },
+      body: jsonEncode({
+        'model': config.model,
+        'messages': messages,
+        'temperature': 0.6,
+        'max_tokens': 450,
+      }),
+    );
+    final data = _decode(response.body);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw GeminiException(
+        _errorMessage(response.statusCode, data),
+        keyProblem: response.statusCode == 400 ||
+            response.statusCode == 401 ||
+            response.statusCode == 403 ||
+            response.statusCode == 429,
+      );
+    }
+    final content = data['choices']?[0]?['message']?['content'];
+    if (content is! String || content.trim().isEmpty) {
+      throw const GeminiException(
+          'The selected AI returned an empty response.');
+    }
+    return content.trim();
   }
 
   Map<String, dynamic> _decode(String body) {

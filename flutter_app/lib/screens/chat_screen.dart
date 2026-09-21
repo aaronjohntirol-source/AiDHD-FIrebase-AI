@@ -3,8 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../models/history_entry.dart';
 import '../providers/app_provider.dart';
-import '../services/ai_key_service.dart';
 import '../services/chat_service.dart';
+import '../services/ai_provider_service.dart';
 import '../services/gemini_service.dart';
 import '../theme/app_theme.dart';
 
@@ -32,9 +32,9 @@ class _ChatScreenState extends State<ChatScreen> {
   final _scrollCtrl = ScrollController();
   final List<_Message> _messages = [];
   final _chatService = ChatService();
-  final _keyService = AiKeyService();
+  final _providerService = AiProviderService();
   final _geminiService = GeminiService();
-  String? _apiKey;
+  AiProviderConfig? _aiConfig;
   bool _isTyping = false;
   bool _isLoading = true;
 
@@ -90,7 +90,7 @@ completion.
     try {
       final records = await _chatService.getMessages(userId);
       if (!mounted) return;
-      _apiKey = await _ensureApiKey();
+      _aiConfig = await _ensureAiConfig();
       if (records.isNotEmpty) {
         _messages.addAll(records.map((record) => _Message(
               id: record.id,
@@ -98,8 +98,14 @@ completion.
               text: record.text,
               time: record.time,
             )));
+        if (_aiConfig != null &&
+            await _providerService.needsDailyCheckIn(userId)) {
+          final checkIn = await _generateOpeningMessage(app);
+          await _addAssistantMessage(userId, checkIn, prefix: 'checkin');
+          await _providerService.markDailyCheckIn(userId);
+        }
       } else {
-        final greeting = _apiKey == null
+        final greeting = _aiConfig == null
             ? _buildGreeting(app)
             : await _generateOpeningMessage(app);
         final message = _Message(
@@ -116,6 +122,7 @@ completion.
           text: message.text,
           time: message.time,
         );
+        if (_aiConfig != null) await _providerService.markDailyCheckIn(userId);
       }
     } catch (_) {
       if (!mounted) return;
@@ -126,48 +133,92 @@ completion.
         time: _now(),
       ));
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() => _isLoading = false);
+        _scrollToBottom();
+      }
     }
   }
 
-  Future<String?> _ensureApiKey({bool replace = false}) async {
+  Future<AiProviderConfig?> _ensureAiConfig({bool replace = false}) async {
     final userId = context.read<AppProvider>().currentUser?.id;
     if (userId == null) return null;
     if (!replace) {
-      final saved = await _keyService.getKey(userId);
+      final saved = await _providerService.getConfig(userId);
       if (saved != null) return saved;
     }
     if (!mounted) return null;
-    final controller = TextEditingController();
-    final key = await showDialog<String>(
+    final saved = await _providerService.getConfig(userId);
+    if (!mounted) return null;
+    var provider = saved?.provider ?? AiProvider.gemini;
+    final providerController = ValueNotifier<AiProvider>(provider);
+    final keyController = TextEditingController(text: saved?.apiKey ?? '');
+    final modelController = TextEditingController(
+        text: saved?.model ?? AiProviderConfig.defaultModel(provider));
+    final endpointController = TextEditingController(
+        text: saved?.endpoint ?? AiProviderConfig.defaultEndpoint(provider));
+    final config = await showDialog<AiProviderConfig>(
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) => AlertDialog(
-        title: Text(replace ? 'Replace Gemini API key' : 'Connect Gemini'),
+        title: Text(replace ? 'Change AI provider' : 'Connect AI chat'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Paste your Gemini API key to use the ADHD support chat. It is stored only on this device for your account and is never added to chat history.',
+              'Choose an AI provider and paste its API key. The key stays on this device and your existing chat history is preserved.',
               style: TextStyle(height: 1.4),
             ),
             const SizedBox(height: 14),
+            ValueListenableBuilder<AiProvider>(
+              valueListenable: providerController,
+              builder: (_, selected, __) => DropdownButtonFormField<AiProvider>(
+                initialValue: selected,
+                decoration: const InputDecoration(
+                    labelText: 'AI provider', border: OutlineInputBorder()),
+                items: AiProvider.values
+                    .map((item) => DropdownMenuItem(
+                        value: item,
+                        child: Text(AiProviderConfig(
+                          provider: item,
+                          apiKey: '',
+                          model: '',
+                          endpoint: '',
+                        ).providerLabel)))
+                    .toList(),
+                onChanged: (value) {
+                  if (value == null) return;
+                  providerController.value = value;
+                  modelController.text = AiProviderConfig.defaultModel(value);
+                  endpointController.text =
+                      AiProviderConfig.defaultEndpoint(value);
+                },
+              ),
+            ),
+            const SizedBox(height: 12),
             TextField(
-              controller: controller,
+              controller: keyController,
               autofocus: true,
               obscureText: true,
               autocorrect: false,
               decoration: const InputDecoration(
                 labelText: 'Gemini API key',
-                hintText: 'AIza...',
+                hintText: 'Paste API key',
                 border: OutlineInputBorder(),
               ),
             ),
             const SizedBox(height: 10),
-            const Text(
-              'Create a key in Google AI Studio. Replace it here if it reaches its usage limit; your conversation will remain available.',
-              style: TextStyle(fontSize: 12, color: AppColors.textMid),
+            TextField(
+              controller: modelController,
+              decoration: const InputDecoration(
+                  labelText: 'Model', border: OutlineInputBorder()),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: endpointController,
+              decoration: const InputDecoration(
+                  labelText: 'API endpoint', border: OutlineInputBorder()),
             ),
           ],
         ),
@@ -179,24 +230,36 @@ completion.
             ),
           FilledButton(
             onPressed: () {
-              final value = controller.text.trim();
-              if (value.isNotEmpty) Navigator.pop(dialogContext, value);
+              final key = keyController.text.trim();
+              if (key.isNotEmpty) {
+                Navigator.pop(
+                    dialogContext,
+                    AiProviderConfig(
+                      provider: providerController.value,
+                      apiKey: key,
+                      model: modelController.text.trim(),
+                      endpoint: endpointController.text.trim(),
+                    ));
+              }
             },
             child: const Text('Save key'),
           ),
         ],
       ),
     );
-    controller.dispose();
-    if (key == null || key.trim().isEmpty) return null;
-    await _keyService.saveKey(userId, key);
-    return key.trim();
+    providerController.dispose();
+    keyController.dispose();
+    modelController.dispose();
+    endpointController.dispose();
+    if (config == null) return null;
+    await _providerService.saveConfig(userId, config);
+    return config;
   }
 
   Future<String> _generateOpeningMessage(AppProvider app) async {
     try {
       return await _geminiService.sendMessage(
-        apiKey: _apiKey!,
+        config: _aiConfig!,
         systemPrompt: _systemPrompt,
         history: const [],
         message: '''You are opening today's AIDHD check-in. Use this context:
@@ -209,9 +272,23 @@ ${jsonEncode(app.buildAiContext())}
     stored data, use clinical labels, or say that you are an AI.''',
       );
     } on GeminiException catch (error) {
-      if (error.keyProblem) _apiKey = await _ensureApiKey(replace: true);
+      if (error.keyProblem) _aiConfig = await _ensureAiConfig(replace: true);
       return _buildGreeting(app);
     }
+  }
+
+  Future<void> _addAssistantMessage(String userId, String text,
+      {String prefix = 'a'}) async {
+    final message = _Message(
+      id: '${prefix}_${DateTime.now().millisecondsSinceEpoch}',
+      isUser: false,
+      text: text,
+      time: _now(),
+    );
+    if (!mounted) return;
+    setState(() => _messages.add(message));
+    await _persistMessage(userId, message);
+    _scrollToBottom();
   }
 
   String _buildGreeting(AppProvider app) {
@@ -266,8 +343,8 @@ ${jsonEncode(app.buildAiContext())}
     final app = context.read<AppProvider>();
     final userId = app.currentUser?.id;
     if (userId == null) return;
-    _apiKey ??= await _ensureApiKey();
-    if (_apiKey == null) return;
+    _aiConfig ??= await _ensureAiConfig();
+    if (_aiConfig == null) return;
     _ctrl.clear();
     final userMessage = _Message(
       id: 'u${DateTime.now().millisecondsSinceEpoch}',
@@ -299,7 +376,7 @@ $text
               })
           .toList();
       final reply = await _geminiService.sendMessage(
-        apiKey: _apiKey!,
+        config: _aiConfig!,
         systemPrompt: _systemPrompt,
         history: history,
         message: prompt,
@@ -318,7 +395,7 @@ $text
     } on GeminiException catch (error) {
       if (!mounted) return;
       if (error.keyProblem) {
-        _apiKey = await _ensureApiKey(replace: true);
+        _aiConfig = await _ensureAiConfig(replace: true);
       }
       setState(() {
         _messages.add(_Message(
@@ -390,8 +467,8 @@ $text
             tooltip: 'Replace Gemini API key',
             icon: const Icon(Icons.key_outlined),
             onPressed: () async {
-              final key = await _ensureApiKey(replace: true);
-              if (key != null && mounted) setState(() => _apiKey = key);
+              final config = await _ensureAiConfig(replace: true);
+              if (config != null && mounted) setState(() => _aiConfig = config);
             },
           ),
         ],
