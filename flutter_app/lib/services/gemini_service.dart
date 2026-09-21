@@ -13,7 +13,7 @@ class GeminiException implements Exception {
 }
 
 class GeminiService {
-  static const _model = 'gemini-2.0-flash';
+  static const _model = 'gemini-3.6-flash';
   static const _endpoint =
       'https://generativelanguage.googleapis.com/v1beta/models/$_model:generateContent';
 
